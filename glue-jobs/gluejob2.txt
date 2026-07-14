@@ -1,0 +1,92 @@
+import sys
+import logging
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from pyspark.sql.functions import col, when, datediff, to_timestamp, lit
+
+# 1. Initialize Glue Context & Catch Dynamic Parameters
+# Expects inputs for the processed zone source and secured zone target
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'PROCESSED_ZONE_PATH', 'SECURED_ZONE_PATH'])
+
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+PROCESSED_ZONE_PATH = args['PROCESSED_ZONE_PATH']
+SECURED_ZONE_PATH = args['SECURED_ZONE_PATH']
+
+# 2. Configure CloudWatch Logger Framework
+MSG_FORMAT = '%(asctime)s %(levelname)s %(name)s: %(message)s'
+logging.basicConfig(format=MSG_FORMAT, level=logging.INFO)
+logger = logging.getLogger("GlueJob2Logger")
+
+logger.info(f"🚀 STARTING SECURED TRANSFORMATION PIPELINE: {args['JOB_NAME']}")
+logger.info(f"📥 Reading Parquet Data From: {PROCESSED_ZONE_PATH}")
+logger.info(f"📤 Target Curated Destination: {SECURED_ZONE_PATH}")
+
+try:
+    # 3. Read Parquet Data from Processed Zone
+    # Glue reads the partitioned parquet structure seamlessly
+    processed_df = spark.read.format("parquet").load(PROCESSED_ZONE_PATH)
+    
+    total_records = processed_df.count()
+    logger.info(f"📈 Total records extracted from Processed Zone: {total_records}")
+    
+    if total_records == 0:
+        logger.warning("⚠️ No records found to transform. Exiting job gracefully.")
+        job.commit()
+        sys.exit(0)
+
+    # 4. Enforce Date Casting for Calculation Safety
+    # Ensuring dates are evaluated correctly as timestamps before performing mathematical duration logic
+    timed_df = processed_df \
+        .withColumn("order_dt", to_timestamp(col("order_date"), "yyyy-MM-dd HH:mm:ss")) \
+        .withColumn("ship_dt", to_timestamp(col("shipping_date"), "yyyy-MM-dd HH:mm:ss"))
+
+    # 5. Transformation 1: Delivery Efficiency Flag (fulfillment_urgency)
+    # Logic: Calculate handling duration (shipping_date - order_date).
+    # If shipping_date is missing (e.g. Pending orders), fallback gracefully to 'ON-TIME' or 'Pending Evaluation'
+    logger.info("⚡ Computing Delivery Efficiency Flags...")
+    
+    df_with_urgency = timed_df.withColumn(
+        "fulfillment_urgency",
+        when(col("ship_dt").isNull(), lit("ON-TIME"))
+        .otherwise(
+            when(datediff(col("ship_dt"), col("order_dt")) > 4, lit("CRITICAL DELAY"))
+            .when(datediff(col("ship_dt"), col("order_dt")) > 2, lit("DELAYED"))
+            .otherwise(lit("ON-TIME"))
+        )
+    )
+
+    # 6. Transformation 2: High-Value Customer Segmentation (customer_segment)
+    # Logic: Categorize based on financial value benchmarks
+    # Tiering: VIP (> $500), Premium ($200 - $500), Standard (< $200)
+    logger.info("⚡ Executing Customer Spend Segmentation...")
+    
+    final_transformed_df = df_with_urgency.withColumn(
+        "customer_segment",
+        when(col("order_amount") > 500.0, lit("VIP"))
+        .when((col("order_amount") >= 200.0) & (col("order_amount") <= 500.0), lit("Premium"))
+        .otherwise(lit("Standard"))
+    ).drop("order_dt", "ship_dt")  # Clean up temporary calculation columns
+
+    # 7. Write Hardened Data to S3 Security Zone
+    # Using overwrite mode and retaining the structural year/month partitioning strategy
+    logger.info(f"💾 Writing transformed analytics data to: {SECURED_ZONE_PATH}")
+    
+    final_transformed_df.write \
+        .mode("overwrite") \
+        .partitionBy("year", "month") \
+        .option("compression", "snappy") \
+        .parquet(SECURED_ZONE_PATH)
+
+    logger.info("🎉 Glue Job 2 completed successfully! Data secured.")
+    job.commit()
+
+except Exception as pipeline_error:
+    logger.error(f"❌ CRITICAL FAILURE IN GLUE JOB 2: {str(pipeline_error)}")
+    raise pipeline_error

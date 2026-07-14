@@ -1,0 +1,51 @@
+import sys
+import logging
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from pyspark.sql.functions import col, sha2
+
+# Initialize Context & Catch parameters
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'SECURED_ZONE_PATH', 'CURATED_ZONE_PATH'])
+
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+SECURED_ZONE_PATH = args['SECURED_ZONE_PATH']
+CURATED_ZONE_PATH = args['CURATED_ZONE_PATH']
+
+# Configure Logger
+MSG_FORMAT = '%(asctime)s %(levelname)s %(name)s: %(message)s'
+logging.basicConfig(format=MSG_FORMAT, level=logging.INFO)
+logger = logging.getLogger("GlueJob3MaskingLogger")
+
+logger.info("🚀 STARTING DATA MASKING & COMPLIANCE PIPELINE...")
+
+try:
+    # 1. Read Data from Secured Bucket
+    secured_df = spark.read.format("parquet").load(SECURED_ZONE_PATH)
+    logger.info(f"📈 Loaded {secured_df.count()} records for PII anonymization.")
+
+    # 2. Apply Data Masking (SHA-256 Hashing on Email)
+    # This keeps data unique for tracking trends, but completely hides actual email text from hackers
+    logger.info("🔒 Masking customer personal identifiable information (PII)...")
+    final_masked_df = secured_df.withColumn("customer_email", sha2(col("customer_email"), 256))
+
+    # 3. Write Masked Parquet Files to the Curated Result Zone
+    logger.info(f"💾 Dumping secure curated results to: {CURATED_ZONE_PATH}")
+    final_masked_df.write \
+        .mode("overwrite") \
+        .partitionBy("year", "month") \
+        .option("compression", "snappy") \
+        .parquet(CURATED_ZONE_PATH)
+
+    logger.info("🎉 Masking complete! Curated dataset is fully locked down.")
+    job.commit()
+
+except Exception as pipeline_error:
+    logger.error(f"❌ CRITICAL FAILURE IN MASKING GLUE JOB 3: {str(pipeline_error)}")
+    raise pipeline_error

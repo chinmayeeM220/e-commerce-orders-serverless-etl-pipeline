@@ -1,0 +1,134 @@
+import sys
+import logging
+import boto3
+from botocore.exceptions import ClientError
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from pyspark.sql.functions import col, when, to_timestamp, year, month, lit
+from pyspark.sql.window import Window
+from pyspark.sql.functions import row_number
+
+# 1. Catch the system and custom job parameters dynamically
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'RAW_SOURCE_PATH', 'PROCESSED_ZONE_PATH'])
+
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+RAW_SOURCE_PATH = args['RAW_SOURCE_PATH']
+PROCESSED_ZONE_PATH = args['PROCESSED_ZONE_PATH']
+
+# 2. Configure Logger Framework for CloudWatch
+MSG_FORMAT = '%(asctime)s %(levelname)s %(name)s: %(message)s'
+logging.basicConfig(format=MSG_FORMAT, level=logging.INFO)
+logger = logging.getLogger("GlueJobLogger")
+
+logger.info(f"🚀 INGESTION LOG TRACE STARTING FOR: {args['JOB_NAME']}")
+logger.info(f"📥 Input URI: {RAW_SOURCE_PATH}")
+logger.info(f"📤 Output Destination Target: {PROCESSED_ZONE_PATH}")
+
+
+def check_bucket_exists(s3_path):
+    """Fail fast with a clear error if the destination bucket doesn't exist,
+    instead of letting Spark's write step throw a buried NoSuchBucket error."""
+    bucket = s3_path.replace("s3://", "").split("/")[0]
+    s3_client = boto3.client("s3")
+    try:
+        s3_client.head_bucket(Bucket=bucket)
+        logger.info(f"✅ Destination bucket verified: {bucket}")
+    except ClientError as e:
+        error_code = e.response.get('Error', {}).get('Code', '')
+        if error_code in ('404', 'NoSuchBucket'):
+            raise ValueError(
+                f"Destination bucket '{bucket}' does not exist. "
+                f"Check PROCESSED_ZONE_PATH parameter for typos, or create the bucket first."
+            ) from e
+        elif error_code == '403':
+            raise ValueError(
+                f"Access denied to destination bucket '{bucket}'. "
+                f"Check the Glue job's IAM role has s3:PutObject/s3:ListBucket permissions."
+            ) from e
+        else:
+            raise
+
+
+try:
+    # 3. Fail fast if destination bucket is misconfigured
+    check_bucket_exists(PROCESSED_ZONE_PATH)
+
+    # 4. Read Raw CSV Ingestion
+    raw_df = spark.read.format("csv") \
+        .option("header", "true") \
+        .load(RAW_SOURCE_PATH)
+
+    logger.info(f"📈 Total initial ingested record rows read: {raw_df.count()}")
+
+    if raw_df.count() == 0:
+        raise ValueError("Ingestion Interrupted: The source CSV file contains no data rows.")
+
+    # 5. Schema Hardening & Timestamp Standardization
+    parsed_df = raw_df \
+        .withColumn("order_amount", col("order_amount").cast("double")) \
+        .withColumn("quantity", col("quantity").cast("int")) \
+        .withColumn("order_date_ts", to_timestamp(col("order_date"), "yyyy-MM-dd HH:mm:ss")) \
+        .withColumn("shipping_date_ts", to_timestamp(col("shipping_date"), "yyyy-MM-dd HH:mm:ss")) \
+        .withColumn("delivery_date_ts", to_timestamp(col("delivery_date"), "yyyy-MM-dd HH:mm:ss"))
+
+    # 6. Missing Value / Identity Checks
+    identity_clean_df = parsed_df.filter(
+        col("order_id").isNotNull() & (col("order_id") != "") & (col("order_id") != "NaN") &
+        col("customer_id").isNotNull() & (col("customer_id") != "") & (col("customer_id") != "NaN")
+    )
+
+    # 7. Value Ranges & Enumeration Validity Checks
+    VALID_STATUSES = ["Pending", "Shipped", "Delivered", "Cancelled"]
+    value_checked_df = identity_clean_df.filter(
+        (col("order_amount") > 0) &
+        (col("quantity") > 0) &
+        col("order_status").isin(VALID_STATUSES)
+    )
+
+    # 8. Chronology Checks (Time Travel Logic Validation)
+    chronology_checked_df = value_checked_df.filter(
+        ((col("order_date_ts") <= col("shipping_date_ts")) | col("shipping_date_ts").isNull()) &
+        ((col("shipping_date_ts") <= col("delivery_date_ts")) | col("delivery_date_ts").isNull()) &
+        ((col("order_date_ts") <= col("delivery_date_ts")) | col("delivery_date_ts").isNull())
+    )
+
+    # 9. Deduplication Engine
+    window_spec = Window.partitionBy("order_id").orderBy(col("order_date_ts").desc())
+    deduplicated_df = chronology_checked_df.withColumn("row_idx", row_number().over(window_spec)) \
+        .filter(col("row_idx") == 1) \
+        .drop("row_idx")
+
+    surviving_records = deduplicated_df.count()
+    logger.info(f"✅ Post-Validation survival count: {surviving_records} records.")
+
+    if surviving_records == 0:
+        raise ValueError("Data Drop Alert: 100% of data rows failed validation criteria rules.")
+
+    # 10. Generate Partition Enablers
+    final_transformed_df = deduplicated_df \
+        .withColumn("year", when(year(col("order_date_ts")).isNotNull(), year(col("order_date_ts")).cast("string")).otherwise(lit("2026"))) \
+        .withColumn("month", when(month(col("order_date_ts")).isNotNull(), month(col("order_date_ts")).cast("string")).otherwise(lit("07"))) \
+        .drop("order_date_ts", "shipping_date_ts", "delivery_date_ts")
+
+    # 11. Optimized Snappy Parquet Target Output
+    logger.info(f"Validation successful. Exporting {surviving_records} records to Processed S3 Target.")
+
+    final_transformed_df.write \
+        .mode("overwrite") \
+        .partitionBy("year", "month") \
+        .option("compression", "snappy") \
+        .parquet(PROCESSED_ZONE_PATH)
+
+    logger.info("🎉 Processing complete! Executing job state commit.")
+    job.commit()
+
+except Exception as pipeline_error:
+    logger.error(f"❌ CRITICAL EXTRACTION FAILURE ENCOUNTERED: {str(pipeline_error)}")
+    raise pipeline_error
